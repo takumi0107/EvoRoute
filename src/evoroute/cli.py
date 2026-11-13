@@ -5,6 +5,7 @@
     evoroute bench     fill the (task x model) response matrix   [slow, resumable]
     evoroute baseline  every routing method across the 2x2 grid
     evoroute figures   redraw the report's figures from the stored results
+    evoroute stats     bootstrap CIs and arrival-order sensitivity
 """
 from __future__ import annotations
 
@@ -363,6 +364,68 @@ def _print_grid(grid: dict[tuple[str, str, str], float]) -> None:
                   "on. Not a result -- it measures what the feature space can "
                   "express at all, so a gap below it is a generalisation "
                   "failure and a gap above it is a feature failure.[/dim]")
+
+
+@app.command()
+def stats(load_profile: str = "warm", resamples: int = 2000,
+          shuffles: int = 200) -> None:
+    """Is the comparison's verdict robust to the sample and to arrival order?"""
+    from .stats import arrival_sensitivity, bootstrap_diff
+
+    with session(DB_PATH) as conn:
+        train_tasks, train_matrix, train_scales = build_context(conn, "train", load_profile)
+        tasks, matrix, scales = build_context(conn, "test", load_profile)
+        order = [t["id"] for t in tasks]
+
+        for mode in MODES:
+            routers = _routers(tasks, matrix, scales, mode)
+            _fit_all(routers, train_tasks, train_matrix, train_scales)
+            routings = {r.name: r.route(tasks) for r in routers}
+            reference = routings["fixed-small"]
+
+            table = Table(title=f"J minus fixed-small, {load_profile}/{mode} "
+                                f"({resamples} paired moving-block bootstrap resamples)",
+                          title_style="bold cyan")
+            for col in ("router", "difference", "95% CI", "resamples won", "verdict"):
+                table.add_column(col)
+            for name in ("rule-based", "learned-tree", "utility-ridge",
+                         "evoroute", "evoroute-ceiling*", "oracle"):
+                if name not in routings:
+                    continue
+                b = bootstrap_diff(routings[name], reference, order, matrix,
+                                   scales, DEFAULT_WEIGHTS, mode, resamples)
+                verdict = ("[dim]identical route[/dim]" if b["tie_rate"] > 0.999 else
+                           "[green]better[/green]" if b["ci_low"] > 0 else
+                           "[red]worse[/red]" if b["ci_high"] < 0 else
+                           "[yellow]indistinguishable[/yellow]")
+                table.add_row(name, f"{b['diff']:+.4f}",
+                              f"[{b['ci_low']:+.4f}, {b['ci_high']:+.4f}]",
+                              f"{b['win_rate']*100:.0f}%", verdict)
+            console.print(table)
+
+        # Arrival order only bites in online execution; batch regroups by tier.
+        tasks_, matrix_, scales_ = tasks, matrix, scales
+        routers = _routers(tasks_, matrix_, scales_, "online")
+        _fit_all(routers, train_tasks, train_matrix, train_scales)
+        table = Table(title=f"online J under randomised arrival order "
+                            f"({shuffles} shuffles, {load_profile} load)",
+                      title_style="bold cyan")
+        for col in ("router", "id-sorted J", "switches", "shuffled J (mean+-sd)",
+                    "shuffled switches", "cost of the assumption"):
+            table.add_column(col)
+        for router in routers:
+            if router.name.startswith("fixed-"):
+                continue
+            a = arrival_sensitivity(router.route(tasks_), [t["id"] for t in tasks_],
+                                    matrix_, scales_, DEFAULT_WEIGHTS, shuffles)
+            table.add_row(router.name, f"{a['sorted']:.4f}",
+                          str(a["sorted_switches"]),
+                          f"{a['mean']:.4f} +- {a['sd']:.4f}",
+                          f"{a['mean_switches']:.0f}",
+                          f"{a['mean'] - a['sorted']:+.4f}")
+        console.print(table)
+        console.print("[dim]fixed routers are omitted: they never switch, so "
+                      "arrival order cannot touch them.[/dim]")
 
 
 @app.command()
