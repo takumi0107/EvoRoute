@@ -44,9 +44,9 @@ J は 0.314 で最低。ローカル実行ではロード時間が推論時間�
 ### 応答行列：1,800 回の推論で全実験をまかなう
 
 全 (タスク × モデル) の組を 1 回だけ実測し、以降のルーター評価も進化的探索の適応度計算も
-すべて辞書引きにした。GA 1 回の実行は 3,600 回の適応度評価を行うが、
-素朴な実装なら 108 万回の推論になる。行列化により **GA 1 実行 ≈ 0.24 秒**
-（15,000 評価/秒）、全実験が 10 秒で終わる。
+すべて辞書引きにした。GA 1 回の実行は 3,600 回の適応度評価 = 108 万回のタスク評価であり、
+素朴な実装なら **GA 1 回に 140 時間以上の推論**がかかる。
+行列化により **GA 1 実行 = 0.48 秒**、40 回の GA 実行を含む比較表全体が 26 秒で終わる。
 
 ### 目的関数：提案時の定義を破棄した
 
@@ -110,11 +110,11 @@ ollama pull qwen2.5:7b-instruct-q4_K_M
 | `evoroute ingest` | データセット取得・プロンプト生成・train/test 分割 | 数十秒 |
 | `evoroute profile --repeats 5 --purge` | ロード時間（warm / cold）と常駐メモリ | 1 分 |
 | `evoroute bench` | 応答行列 1,800 セルを実測（**再開可能**） | 約 7 分 |
-| `evoroute baseline` | 5 方式 × 実行モード × ロード機構の比較表 | 15 秒 |
-| `evoroute stats` | ブートストラップ CI と到着順感度 | 30 秒 |
-| `evoroute cascade` | 入力のみ vs カスケード、sklearn 対照実験 | 20 秒 |
-| `evoroute learning-curve` | 訓練データ量を変えたときの到達値 | 15 秒 |
-| `evoroute figures` | 図 3 枚を再描画 | 2 秒 |
+| `evoroute baseline` | 5 方式 × 実行モード × ロード機構の比較表 | 26 秒 |
+| `evoroute stats` | ブートストラップ CI と到着順感度 | 25 秒 |
+| `evoroute cascade` | 入力のみ vs カスケード、sklearn 対照実験 | 27 秒 |
+| `evoroute learning-curve` | 訓練データ量を変えたときの到達値 | 9 秒 |
+| `evoroute figures` | 図 3 枚を再描画 | 1.4 秒 |
 | `evoroute refresh --dataset X` | プロンプトを再生成し、影響したセルだけ無効化 | 即時 |
 | `evoroute export` / `import-snapshot` | 測定結果の書き出し・復元 | 即時 |
 
