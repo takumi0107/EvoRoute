@@ -113,6 +113,7 @@ ollama pull qwen2.5:7b-instruct-q4_K_M
 | `evoroute baseline` | 5 方式 × 実行モード × ロード機構の比較表 | 15 秒 |
 | `evoroute stats` | ブートストラップ CI と到着順感度 | 30 秒 |
 | `evoroute cascade` | 入力のみ vs カスケード、sklearn 対照実験 | 20 秒 |
+| `evoroute learning-curve` | 訓練データ量を変えたときの到達値 | 15 秒 |
 | `evoroute figures` | 図 3 枚を再描画 | 2 秒 |
 | `evoroute refresh --dataset X` | プロンプトを再生成し、影響したセルだけ無効化 | 即時 |
 | `evoroute export` / `import-snapshot` | 測定結果の書き出し・復元 | 即時 |

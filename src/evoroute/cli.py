@@ -7,6 +7,7 @@
     evoroute figures   redraw the report's figures from the stored results
     evoroute stats     bootstrap CIs and arrival-order sensitivity
     evoroute cascade   does seeing the small model's answer first help?
+    evoroute learning-curve   does more training data close the gap?
     evoroute export    write the measured matrix to a portable snapshot
     evoroute import-snapshot   rebuild a database from one
 """
@@ -569,6 +570,69 @@ def _sklearn_crosscheck(conn, train_tasks, train_matrix, train_scales,
     console.print(table)
     console.print(f"[dim]always-small = {floor:.6f}. "
                   "Not one learner clears it, so the failure is not the GA's.[/dim]")
+
+
+@app.command("learning-curve")
+def learning_curve(load_profile: str = "warm", mode: str = "online",
+                   cascade_features: bool = True, seeds: int = 3) -> None:
+    """Fit on growing subsets of the train split, score on the full test split.
+
+    A result that is stuck at the baseline has two readings: too little data,
+    or nothing to learn. They look different here. Too little data climbs
+    toward the ceiling as the subset grows; nothing to learn converges on the
+    baseline and stays there -- more data only makes the search *more* certain
+    that not routing is correct.
+    """
+    import numpy as np
+
+    from .db import base_runs
+    from .evolution.search import Context, evolve
+
+    with session(DB_PATH) as conn:
+        train_tasks, train_matrix, train_scales = build_context(conn, "train", load_profile)
+        tasks, matrix, scales = build_context(conn, "test", load_profile)
+        runs = ({split: base_runs(conn, split, TIERS[0]) for split in ("train", "test")}
+                if cascade_features else None)
+        test_ctx = Context(tasks, matrix, scales, runs["test"] if runs else None)
+
+        is_cascade = runs is not None
+        order = [t["id"] for t in tasks]
+        from .objective import evaluate_route, optimal_route
+        floor = evaluate_route({t: TIERS[0] for t in order}, order, matrix, scales,
+                               DEFAULT_WEIGHTS, mode, is_cascade).objective
+        oracle = evaluate_route(
+            optimal_route(order, matrix, scales, DEFAULT_WEIGHTS, mode, is_cascade),
+            order, matrix, scales, DEFAULT_WEIGHTS, mode, is_cascade).objective
+        ceiling = max(
+            (evolve(test_ctx, test_ctx, DEFAULT_WEIGHTS, mode,
+                    EvolutionConfig(**{**EvolutionConfig().__dict__, "seed": s}))
+             for s in range(seeds)), key=lambda r: r.best_train).best_test
+
+        rng = np.random.default_rng(0)
+        sizes = [n for n in (60, 120, 180, 240, len(train_tasks))
+                 if n <= len(train_tasks)]
+        table = Table(title=f"EvoRoute vs training-set size "
+                            f"({load_profile}/{mode}, "
+                            f"{'cascade' if is_cascade else 'input-only'} features, "
+                            f"{seeds} seeds)", title_style="bold cyan")
+        for col in ("train tasks", "J (train)", "J (test)", "vs always-small"):
+            table.add_column(col)
+        for n in sizes:
+            picks = rng.choice(len(train_tasks), n, replace=False)
+            subset = [train_tasks[i] for i in sorted(picks)]
+            ctx = Context(subset, train_matrix, train_scales,
+                          {t["id"]: runs["train"][t["id"]] for t in subset}
+                          if runs else None)
+            best = max((evolve(ctx, test_ctx, DEFAULT_WEIGHTS, mode,
+                               EvolutionConfig(**{**EvolutionConfig().__dict__, "seed": s}))
+                        for s in range(seeds)), key=lambda r: r.best_train)
+            delta = best.best_test - floor
+            style = "[green]" if delta > 1e-6 else "[red]" if delta < -1e-6 else "[dim]"
+            table.add_row(str(n), f"{best.best_train:.6f}", f"{best.best_test:.6f}",
+                          f"{style}{delta:+.6f}[/]")
+        console.print(table)
+        console.print(f"[dim]always-small = {floor:.6f} · expressible ceiling = "
+                      f"{ceiling:.6f} · oracle = {oracle:.6f}[/dim]")
 
 
 SNAPSHOT = Path("data/measurements.json.gz")
