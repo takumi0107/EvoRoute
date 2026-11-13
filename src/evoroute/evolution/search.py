@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ..config import DEFAULT_WEIGHTS, ObjectiveWeights
-from ..features import vector
+from ..features import cascade_vector, vector
 from ..objective import Mode, Scales, evaluate_route
 from .genome import FeatureSpace, Genome, assign, random_genome, routing_of
 from .operators import crossover, mutate, tournament
@@ -27,16 +27,30 @@ from .operators import crossover, mutate, tournament
 
 @dataclass
 class Context:
-    """One split, pre-vectorised so fitness evaluation is pure numpy."""
+    """One split, pre-vectorised so fitness evaluation is pure numpy.
+
+    `base_runs` maps task id -> the small model's stored run. Supplying it
+    switches the feature space to the cascade one and costs routing decisions
+    accordingly; leaving it out keeps the pre-hoc, input-only setting.
+    """
 
     tasks: list
     matrix: dict
     scales: Scales
+    base_runs: dict | None = None
     X: np.ndarray = field(init=False)
     order: list = field(init=False)
+    cascade: bool = field(init=False)
 
     def __post_init__(self) -> None:
-        self.X = np.asarray([vector(t) for t in self.tasks], dtype=float)
+        self.cascade = self.base_runs is not None
+        if self.cascade:
+            rows = [cascade_vector(t, self.base_runs[t["id"]]["raw_output"],
+                                   self.base_runs[t["id"]]["eval_count"])
+                    for t in self.tasks]
+        else:
+            rows = [vector(t) for t in self.tasks]
+        self.X = np.asarray(rows, dtype=float)
         self.order = [t["id"] for t in self.tasks]
 
 
@@ -77,7 +91,7 @@ def _score(genome: Genome, ctx: Context, weights: ObjectiveWeights,
         X, order = ctx.X[idx], [ctx.order[i] for i in idx]
     routing = routing_of(genome, X, order)
     return evaluate_route(routing, order, ctx.matrix, ctx.scales,
-                          weights, mode).objective
+                          weights, mode, ctx.cascade).objective
 
 
 def _behavioural_diversity(population: list[Genome], X: np.ndarray) -> float:

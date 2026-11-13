@@ -22,6 +22,25 @@ NUMERIC_FEATURES = (
 
 FEATURE_NAMES = NUMERIC_FEATURES + tuple(f"is_{t}" for t in TASK_TYPES)
 
+# Cascade features: properties of the *small model's own answer*, available
+# only once it has run. They are not leakage -- nothing here touches the gold
+# label -- but they do change the architecture, since the small inference must
+# be paid on every task before the router can consult them.
+#
+# They exist because the input-only features above turned out to carry almost
+# no signal about which tasks need a bigger model: even fitted directly on the
+# test split, a rule over them captured just 13% of the oracle's headroom.
+# Measured on the train split, over-extraction is the clearest tell -- when the
+# small model is wrong it emits 2.5x the entities and 3x the characters.
+CASCADE_FEATURES = (
+    "out_tokens", "out_chars", "out_lines", "out_items",
+    "out_in_ratio", "out_has_prose", "out_repeats", "out_degenerate",
+)
+
+CASCADE_FEATURE_NAMES = FEATURE_NAMES + CASCADE_FEATURES
+
+_PROSE = re.compile(r"\b(the|is|are|this|which|because|there|would)\b")
+
 
 def _body(prompt: str) -> str:
     """Strip the instruction scaffolding so length features describe the
@@ -60,3 +79,34 @@ def extract(task: dict[str, Any]) -> dict[str, float]:
 def vector(task: dict[str, Any]) -> list[float]:
     f = extract(task)
     return [f[name] for name in FEATURE_NAMES]
+
+
+def cascade_extract(task: dict[str, Any], raw: str,
+                    eval_count: int | None = None) -> dict[str, float]:
+    """Features describing what the small model replied, not what it was asked."""
+    from .evaluation.metrics import parse_entities
+
+    text = raw.strip()
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    items = parse_entities(raw) if task["task_type"] == "extraction" else ([text] if text else [])
+    input_chars = max(len(_body(task["prompt"])), 1)
+    lowered = text.lower()
+
+    return {
+        "out_tokens": float(eval_count or 0),
+        "out_chars": float(len(text)),
+        "out_lines": float(len(lines)),
+        "out_items": float(len(items)),
+        "out_in_ratio": len(text) / input_chars,
+        "out_has_prose": 1.0 if _PROSE.search(lowered) else 0.0,
+        "out_repeats": 1.0 if len(lines) != len({l.lower() for l in lines}) else 0.0,
+        "out_degenerate": 1.0 if (not text or lowered.startswith("none")) else 0.0,
+    }
+
+
+def cascade_vector(task: dict[str, Any], raw: str,
+                   eval_count: int | None = None) -> list[float]:
+    """Input features followed by cascade features, in CASCADE_FEATURE_NAMES order."""
+    f = extract(task)
+    f.update(cascade_extract(task, raw, eval_count))
+    return [f[name] for name in CASCADE_FEATURE_NAMES]
