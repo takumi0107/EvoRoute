@@ -98,3 +98,28 @@ def headroom(matrix: dict, tasks: list[dict], best_fixed_accuracy: float) -> dic
         "best_fixed_accuracy": best_fixed_accuracy,
         "headroom": ceiling - best_fixed_accuracy,
     }
+
+
+def persist_generations(conn: sqlite3.Connection, experiment_id: int,
+                        router_name: str, results, mode: Mode,
+                        load_profile: str) -> None:
+    """Store every seed's curve, not just the winner's.
+
+    The spread across seeds is the difference between "the search found this"
+    and "one run got lucky", so discarding the losing seeds would discard the
+    only evidence that distinguishes them.
+    """
+    rows = []
+    for result in results:
+        seed = result.history[0].get("seed", 0) if result.history else 0
+        for record in result.history:
+            rows.append((experiment_id, router_name, mode, load_profile, seed,
+                         record["generation"], record["best_train"],
+                         record["mean_train"], record["best_test"],
+                         record["diversity"],
+                         json.dumps(record["best_genome"].to_dict()),
+                         record["evaluations"], record["elapsed_s"]))
+    conn.executemany(
+        "INSERT INTO generations (experiment_id, router, mode, load_profile, seed, "
+        "generation, best_train, mean_train, best_test, diversity, best_genome, "
+        "evaluations, elapsed_s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)

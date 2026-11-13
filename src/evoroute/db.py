@@ -142,6 +142,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
                          ("inference_ms", "REAL"), ("total_ms", "REAL")):
         if column not in have:
             conn.execute(f"ALTER TABLE router_results ADD COLUMN {column} {decl}")
+    # One experiment now holds several GA runs -- two routers across the 2x2
+    # grid of execution mode and load regime -- so a curve has to say which.
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(generations)")}
+    for column, decl in (("router", "TEXT"), ("mode", "TEXT"),
+                         ("load_profile", "TEXT")):
+        if column not in have:
+            conn.execute(f"ALTER TABLE generations ADD COLUMN {column} {decl}")
     conn.commit()
 
 
@@ -199,6 +206,20 @@ def response_matrix(conn: sqlite3.Connection, split: str | None = None) -> dict:
             "peak_rss_mb": row["peak_rss_mb"],
         }
     return out
+
+
+def base_runs(conn: sqlite3.Connection, split: str, tier: str) -> dict[int, dict]:
+    """The stored output of one model on every task in a split.
+
+    The cascade setting needs these: its features are read off the small
+    model's answer, so the answer has to be recoverable from cache rather than
+    regenerated -- otherwise the whole point of the matrix is lost.
+    """
+    rows = conn.execute(
+        "SELECT r.task_id, r.raw_output, r.eval_count, r.score "
+        "FROM runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE t.split = ? AND r.tier = ? AND r.repeat_idx = 0", (split, tier))
+    return {r["task_id"]: dict(r) for r in rows}
 
 
 def start_experiment(conn: sqlite3.Connection, name: str, config: dict,

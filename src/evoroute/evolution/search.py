@@ -140,6 +140,7 @@ def evolve(train: Context, test: Context,
             best_genome, best_train, best_test = champion, champion_train, champion_test
 
         history.append({
+            "seed": config.seed,
             "generation": generation,
             "best_train": champion_train,
             "mean_train": float(np.mean(raw)),

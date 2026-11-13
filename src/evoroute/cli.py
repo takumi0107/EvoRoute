@@ -23,7 +23,9 @@ from .evaluation.harness import build_matrix, profile_models
 from .models.ollama_client import OllamaClient
 from .objective import MODES
 from .pipeline import (build_context, git_sha, headroom, load_profile_available,
-                       persist, run_router)
+                       persist, persist_generations, run_router)
+from .evolution.search import EvolutionConfig
+from .routers.evolved import CeilingRouter, EvolvedRouter
 from .routers.fixed import FixedRouter
 from .routers.learned import LearnedRouter, UtilityRouter, feature_importances
 from .routers.oracle import OracleRouter
@@ -102,8 +104,18 @@ def refresh(dataset: str = typer.Option(..., help="dataset name to regenerate"),
                       f"{stale} cells[/green]")
 
 
-def _routers(matrix, scales, mode):
-    """Every method under comparison, oracle last."""
+GA_SEEDS = (0, 1, 2, 3, 4)
+
+
+def _routers(tasks, matrix, scales, mode):
+    """Every method under comparison: the five of the proposal, plus diagnostics.
+
+    `tasks/matrix/scales` describe the split results are *reported* on. The
+    evolved routers get it so each generation can be scored there and the
+    train/test curves plotted apart; selection still reads train fitness only.
+    The one exception is `evoroute-ceiling*`, which is told to fit there on
+    purpose -- see routers/evolved.py.
+    """
     out = [FixedRouter(t) for t in TIERS]
     out.append(RuleBasedRouter())
     out.append(TunedRuleRouter())
@@ -112,6 +124,11 @@ def _routers(matrix, scales, mode):
     out.append(LearnedRouter("tree", balanced=False))
     out.append(UtilityRouter("tree"))
     out.append(UtilityRouter("ridge"))
+    evolved = [EvolvedRouter(mode, seeds=GA_SEEDS),
+               CeilingRouter(mode, seeds=GA_SEEDS)]
+    for router in evolved:
+        router.prepare(tasks, matrix, scales)
+    out.extend(evolved)
     out.append(OracleRouter(matrix, scales, DEFAULT_WEIGHTS, mode))
     return out
 
@@ -218,8 +235,12 @@ def baseline(split: str = "test") -> None:
             tasks, matrix, scales = build_context(conn, split, load_profile)
 
             for mode in MODES:
-                routers = _routers(matrix, scales, mode)
+                routers = _routers(tasks, matrix, scales, mode)
                 _fit_all(routers, train_tasks, train_matrix, train_scales)
+                for router in routers:
+                    if isinstance(router, EvolvedRouter) and router.results:
+                        persist_generations(conn, exp, router.name, router.results,
+                                            mode, load_profile)
 
                 table = Table(title=f"{load_profile} load / {mode} execution",
                               title_style="bold cyan")
@@ -262,6 +283,13 @@ def baseline(split: str = "test") -> None:
                         console.print("[dim]learned-tree top features: "
                                       + ", ".join(f"{k}={v:.2f}" for k, v in top) + "[/dim]")
 
+                evo = next(r for r in routers if r.name == "evoroute")
+                spread = evo.seed_spread()
+                console.print(f"[dim]evoroute over {spread['n']} seeds: "
+                              f"J(test) min={spread['min']:.4f} "
+                              f"median={spread['median']:.4f} max={spread['max']:.4f}"
+                              f"  |  winner: " + "; ".join(evo.describe()) + "[/dim]")
+
         _print_grid(grid)
 
         h = headroom(matrix, tasks, best_fixed)
@@ -272,12 +300,21 @@ def baseline(split: str = "test") -> None:
 
 
 def _print_grid(grid: dict[tuple[str, str, str], float]) -> None:
-    """Does routing beat the best single model, per cell? This is the headline."""
+    """The headline, in three layers per cell.
+
+    `fixed` is what not routing costs. `oracle` is what perfect routing would
+    be worth. `ceiling` is what the *features* could reach if generalisation
+    were free. A router stuck at `fixed` while the ceiling sits near it has a
+    different problem from one stuck at `fixed` with a high ceiling above, and
+    the grid is useless if it cannot tell those two apart.
+    """
+    # Ties below this are noise: the GA's spread across seeds is larger.
+    TIE = 1e-3
     profiles = sorted({lp for _, _, lp in grid})
     if not profiles:
         return
-    table = Table(title="best achievable router vs best single model "
-                        "(and how much of the ceiling it captures)",
+    table = Table(title="routing vs the best single model, and how much of the "
+                        "available headroom each layer reaches",
                   title_style="bold magenta")
     table.add_column("load regime")
     for mode in MODES:
@@ -286,23 +323,44 @@ def _print_grid(grid: dict[tuple[str, str, str], float]) -> None:
         cells = []
         for mode in MODES:
             oracle = grid.get(("oracle", mode, lp))
+            ceiling = grid.get(("evoroute-ceiling*", mode, lp))
             fixed = max((v for (r, m, p), v in grid.items()
                          if r.startswith("fixed-") and m == mode and p == lp), default=None)
             real = max(((v, r) for (r, m, p), v in grid.items()
                         if r != "oracle" and not r.startswith("fixed-")
+                        and not r.endswith("*")
                         and m == mode and p == lp), default=None)
             if oracle is None or fixed is None or real is None:
                 cells.append("-")
                 continue
             value, name = real
             room = oracle - fixed
-            captured = (value - fixed) / room if abs(room) > 1e-9 else 0.0
-            verdict = "[green]beats single[/green]" if value > fixed else "[red]loses to single[/red]"
-            cells.append(f"{verdict}\n{name} J={value:.4f}\n"
-                         f"fixed={fixed:.4f} oracle={oracle:.4f}\n"
-                         f"captured {captured*100:.0f}% of headroom")
+            margin = value - fixed
+
+            def share(x: float | None) -> str:
+                if x is None or abs(room) < 1e-9:
+                    return "n/a"
+                return f"{(x - fixed) / room * 100:.1f}%"
+
+            if margin > TIE:
+                verdict = f"[green]beats single[/green] ({margin:+.4f})"
+            elif margin < -TIE:
+                verdict = f"[red]loses to single[/red] ({margin:+.4f})"
+            else:
+                verdict = f"[yellow]ties single[/yellow] ({margin:+.4f})"
+            evo = grid.get(("evoroute", mode, lp))
+            cells.append(
+                f"{verdict}\n"
+                f"best honest: {name} J={value:.4f}\n"
+                f"fixed={fixed:.4f}  oracle={oracle:.4f}\n"
+                f"[bold]reached[/bold]  {share(evo)} (evoroute)\n"
+                f"[bold]expressible[/bold]  {share(ceiling)} (ceiling*)")
         table.add_row(lp, *cells)
     console.print(table)
+    console.print("[dim]* evoroute-ceiling is fitted on the split it is scored "
+                  "on. Not a result -- it measures what the feature space can "
+                  "express at all, so a gap below it is a generalisation "
+                  "failure and a gap above it is a feature failure.[/dim]")
 
 
 if __name__ == "__main__":
