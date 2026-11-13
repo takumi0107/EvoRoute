@@ -3,11 +3,13 @@
     evoroute ingest    load datasets into SQLite
     evoroute profile   measure cold load time + footprint per model
     evoroute bench     fill the (task x model) response matrix   [slow, resumable]
-    evoroute baseline  fixed models + oracle -> the go/no-go table
+    evoroute baseline  every routing method across the 2x2 grid
+    evoroute figures   redraw the report's figures from the stored results
 """
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -361,6 +363,18 @@ def _print_grid(grid: dict[tuple[str, str, str], float]) -> None:
                   "on. Not a result -- it measures what the feature space can "
                   "express at all, so a gap below it is a generalisation "
                   "failure and a gap above it is a feature failure.[/dim]")
+
+
+@app.command()
+def figures(outdir: Path = typer.Option(Path("results/figures"),
+                                        help="where the PNGs are written")) -> None:
+    """Redraw every figure from the database. Measures nothing."""
+    from .viz import render_all
+
+    with session(DB_PATH) as conn:
+        paths = render_all(conn, outdir)
+    for p in paths:
+        console.print(f"[green]{p}[/green]")
 
 
 if __name__ == "__main__":
