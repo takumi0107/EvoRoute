@@ -141,6 +141,33 @@ def _local_gain(task_id: int, tier: str, matrix: dict, scales: Scales,
             - weights.memory / (scales.mem_ref * n) * scales.resident_mb.get(tier, 0.0))
 
 
+def local_gains(task_id: int, matrix: dict, scales: Scales,
+                weights: ObjectiveWeights = DEFAULT_WEIGHTS,
+                n: int = 1) -> dict[str, float]:
+    """Per-tier utility of one task, with the sequencing term left out.
+
+    Load cost depends on what ran *before*, which a per-task router cannot
+    see, so it is excluded here by construction. That exclusion is the gap
+    evolutionary search is meant to exploit: a strategy evaluated as a whole
+    can trade a little per-task utility for far fewer reloads, and no
+    per-task classifier can represent that trade.
+    """
+    return {t: _local_gain(task_id, t, matrix, scales, weights, n) for t in TIERS}
+
+
+def best_local_tier(task_id: int, matrix: dict, scales: Scales,
+                    weights: ObjectiveWeights = DEFAULT_WEIGHTS,
+                    n: int = 1) -> str:
+    """The supervision signal for a learned router.
+
+    Not "which model got it right": several may, and when none do the cheapest
+    is still correct to pick. Taking the argmax of utility handles both without
+    a special case.
+    """
+    gains = local_gains(task_id, matrix, scales, weights, n)
+    return max(TIERS, key=lambda t: (gains[t], -TIERS.index(t)))
+
+
 def _optimal_online(order, matrix, scales, weights):
     """Exact argmax of J by DP: switch cost depends only on the previous tier,
     so the optimum factorises into |TIERS| states per task."""

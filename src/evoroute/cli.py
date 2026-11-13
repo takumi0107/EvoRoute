@@ -25,8 +25,9 @@ from .objective import MODES
 from .pipeline import (build_context, git_sha, headroom, load_profile_available,
                        persist, run_router)
 from .routers.fixed import FixedRouter
+from .routers.learned import LearnedRouter, UtilityRouter, feature_importances
 from .routers.oracle import OracleRouter
-from .routers.rule_based import RuleBasedRouter
+from .routers.rule_based import RuleBasedRouter, TunedRuleRouter
 
 app = typer.Typer(add_completion=False, help=__doc__)
 console = Console()
@@ -101,6 +102,28 @@ def refresh(dataset: str = typer.Option(..., help="dataset name to regenerate"),
                       f"{stale} cells[/green]")
 
 
+def _routers(matrix, scales, mode):
+    """Every method under comparison, oracle last."""
+    out = [FixedRouter(t) for t in TIERS]
+    out.append(RuleBasedRouter())
+    out.append(TunedRuleRouter())
+    out.append(LearnedRouter("tree"))
+    out.append(LearnedRouter("logreg"))
+    out.append(LearnedRouter("tree", balanced=False))
+    out.append(UtilityRouter("tree"))
+    out.append(UtilityRouter("ridge"))
+    out.append(OracleRouter(matrix, scales, DEFAULT_WEIGHTS, mode))
+    return out
+
+
+def _fit_all(routers, train_tasks, train_matrix, train_scales):
+    """Fit whatever can be fitted, on the train split only."""
+    for router in routers:
+        fit = getattr(router, "fit", None)
+        if fit is not None:
+            fit(train_tasks, train_matrix, train_scales, DEFAULT_WEIGHTS)
+
+
 @app.command()
 def profile(repeats: int = 5,
             purge: bool = typer.Option(
@@ -167,12 +190,16 @@ def _matrix_summary(conn) -> None:
 
 @app.command()
 def baseline(split: str = "test") -> None:
-    """Fixed baselines + rule-based + oracle, across every execution mode and
-    load regime. Prints the go/no-go headroom and the mode x regime grid."""
+    """Compare every routing method across execution mode and load regime.
+
+    Fittable routers are trained on the train split and scored on `split`;
+    both numbers are shown so the generalisation gap is visible rather than
+    inferred.
+    """
     with session(DB_PATH) as conn:
         exp = conn.execute(
             "INSERT INTO experiments (name, config, git_sha) VALUES (?,?,?)",
-            (f"baseline-{split}",
+            (f"compare-{split}",
              json.dumps({"split": split, "weights": DEFAULT_WEIGHTS.__dict__,
                          "modes": list(MODES), "load_profiles": list(LOAD_PROFILES)}),
              git_sha())).lastrowid
@@ -180,36 +207,60 @@ def baseline(split: str = "test") -> None:
         grid: dict[tuple[str, str, str], float] = {}
         best_fixed = 0.0
         tasks = matrix = None
+        described = False
 
         for load_profile in LOAD_PROFILES:
             if not load_profile_available(conn, load_profile):
                 console.print(f"[yellow]skipping load profile '{load_profile}': "
                               f"not measured (run `evoroute profile --purge`)[/yellow]")
                 continue
+            train_tasks, train_matrix, train_scales = build_context(conn, "train", load_profile)
             tasks, matrix, scales = build_context(conn, split, load_profile)
+
             for mode in MODES:
-                routers = [FixedRouter(t) for t in TIERS]
-                routers.append(RuleBasedRouter())
-                routers.append(OracleRouter(matrix, scales, DEFAULT_WEIGHTS, mode))
+                routers = _routers(matrix, scales, mode)
+                _fit_all(routers, train_tasks, train_matrix, train_scales)
 
                 table = Table(title=f"{load_profile} load / {mode} execution",
                               title_style="bold cyan")
-                for col in ("router", "accuracy", "infer (s)", "load (s)",
-                            "total (s)", "switches", "peak MB", "J"):
+                for col in ("router", "acc", "infer (s)", "load (s)", "total (s)",
+                            "switch", "J (train)", "J (test)", "gap"):
                     table.add_column(col)
+
                 for router in routers:
                     out, routing = run_router(router, tasks, matrix, scales,
                                               DEFAULT_WEIGHTS, mode)
                     persist(conn, exp, router.name, split, 0, out, routing,
                             mode, load_profile)
+                    # The oracle reads a matrix directly, so scoring it on the
+                    # train split needs one bound to that split's context.
+                    train_router = (OracleRouter(train_matrix, train_scales,
+                                                 DEFAULT_WEIGHTS, mode)
+                                    if isinstance(router, OracleRouter) else router)
+                    tr, _ = run_router(train_router, train_tasks, train_matrix,
+                                       train_scales, DEFAULT_WEIGHTS, mode)
                     grid[(router.name, mode, load_profile)] = out.objective
                     if router.name.startswith("fixed-"):
                         best_fixed = max(best_fixed, out.accuracy)
+                    gap = tr.objective - out.objective
+                    style = "[red]" if gap > 0.02 else ""
                     table.add_row(router.name, f"{out.accuracy:.3f}",
                                   f"{out.inference_ms/1000:.1f}", f"{out.load_ms/1000:.1f}",
                                   f"{out.total_ms/1000:.1f}", str(out.switches),
-                                  f"{out.peak_resident_mb:.0f}", f"{out.objective:.4f}")
+                                  f"{tr.objective:.4f}", f"{out.objective:.4f}",
+                                  f"{style}{gap:+.4f}")
                 console.print(table)
+
+                if not described:
+                    described = True
+                    tuned = next(r for r in routers if r.name == "rule-based-tuned")
+                    console.print("[dim]tuned rules (train-fitted): "
+                                  + "; ".join(tuned.describe()) + "[/dim]")
+                    tree = next(r for r in routers if r.name == "learned-tree")
+                    top = feature_importances(tree)[:4]
+                    if top:
+                        console.print("[dim]learned-tree top features: "
+                                      + ", ".join(f"{k}={v:.2f}" for k, v in top) + "[/dim]")
 
         _print_grid(grid)
 
@@ -218,11 +269,6 @@ def baseline(split: str = "test") -> None:
             f"\n[bold]accuracy ceiling[/bold]  oracle={h['oracle_accuracy']:.3f}  "
             f"best fixed={h['best_fixed_accuracy']:.3f}  "
             f"[bold]headroom={h['headroom']:+.3f}[/bold]")
-        if h["headroom"] < 0.05:
-            console.print("[yellow]headroom < 0.05: routing cannot win on accuracy "
-                          "here. Reframe around cost, or change tasks/models.[/yellow]")
-        else:
-            console.print("[green]routing has accuracy headroom -- proceed to Week 2.[/green]")
 
 
 def _print_grid(grid: dict[tuple[str, str, str], float]) -> None:
@@ -230,7 +276,8 @@ def _print_grid(grid: dict[tuple[str, str, str], float]) -> None:
     profiles = sorted({lp for _, _, lp in grid})
     if not profiles:
         return
-    table = Table(title="does routing beat the best fixed model?",
+    table = Table(title="best achievable router vs best single model "
+                        "(and how much of the ceiling it captures)",
                   title_style="bold magenta")
     table.add_column("load regime")
     for mode in MODES:
@@ -240,14 +287,20 @@ def _print_grid(grid: dict[tuple[str, str, str], float]) -> None:
         for mode in MODES:
             oracle = grid.get(("oracle", mode, lp))
             fixed = max((v for (r, m, p), v in grid.items()
-                         if r.startswith("fixed-") and m == mode and p == lp),
-                        default=None)
-            if oracle is None or fixed is None:
+                         if r.startswith("fixed-") and m == mode and p == lp), default=None)
+            real = max(((v, r) for (r, m, p), v in grid.items()
+                        if r != "oracle" and not r.startswith("fixed-")
+                        and m == mode and p == lp), default=None)
+            if oracle is None or fixed is None or real is None:
                 cells.append("-")
                 continue
-            delta = oracle - fixed
-            verdict = "[green]routing[/green]" if delta > 1e-6 else "[red]single model[/red]"
-            cells.append(f"{verdict}  (J {oracle:.4f} vs {fixed:.4f}, {delta:+.4f})")
+            value, name = real
+            room = oracle - fixed
+            captured = (value - fixed) / room if abs(room) > 1e-9 else 0.0
+            verdict = "[green]beats single[/green]" if value > fixed else "[red]loses to single[/red]"
+            cells.append(f"{verdict}\n{name} J={value:.4f}\n"
+                         f"fixed={fixed:.4f} oracle={oracle:.4f}\n"
+                         f"captured {captured*100:.0f}% of headroom")
         table.add_row(lp, *cells)
     console.print(table)
 
