@@ -229,3 +229,55 @@ def start_experiment(conn: sqlite3.Connection, name: str, config: dict,
         (name, json.dumps(config, ensure_ascii=False, sort_keys=True), git_sha),
     )
     return int(cur.lastrowid)
+
+
+# -- portable snapshot of the measurements --------------------------------
+# The response matrix costs 1,800 inferences and roughly seven minutes of
+# wall clock; everything else in the project is a few seconds of arithmetic on
+# top of it. Shipping it as a file is what makes the analysis reproducible
+# from a clone, and a text format is what keeps it reviewable -- the database
+# itself is binary and churns on every `baseline` run, which would make the
+# measurement indistinguishable from the analysis in the history.
+SNAPSHOT_TABLES = ("models", "tasks", "runs")
+
+
+def export_snapshot(conn: sqlite3.Connection, path: Path | str) -> dict[str, int]:
+    """Write the measured tables to gzipped JSON. Derived tables are omitted."""
+    import gzip
+
+    payload, counts = {}, {}
+    for table in SNAPSHOT_TABLES:
+        rows = [dict(r) for r in conn.execute(f"SELECT * FROM {table}")]
+        payload[table] = rows
+        counts[table] = len(rows)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(path, "wt", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, sort_keys=True, indent=0)
+    return counts
+
+
+def import_snapshot(conn: sqlite3.Connection, path: Path | str) -> dict[str, int]:
+    """Load a snapshot into an empty database, refusing to overwrite measurements."""
+    import gzip
+
+    with gzip.open(Path(path), "rt", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    existing = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+    if existing:
+        raise RuntimeError(
+            f"database already holds {existing} measured runs; import would "
+            "mix two measurement sessions. Remove the database file first.")
+    counts = {}
+    for table in SNAPSHOT_TABLES:
+        rows = payload.get(table, [])
+        counts[table] = len(rows)
+        if not rows:
+            continue
+        cols = list(rows[0])
+        marks = ",".join("?" * len(cols))
+        conn.executemany(
+            f"INSERT OR REPLACE INTO {table} ({','.join(cols)}) VALUES ({marks})",
+            [[r.get(c) for c in cols] for r in rows])
+    conn.commit()
+    return counts

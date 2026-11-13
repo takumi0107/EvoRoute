@@ -105,3 +105,27 @@ def test_identical_routers_compare_as_an_exact_tie():
     assert out["diff"] == 0.0
     assert out["tie_rate"] == 1.0
     assert (out["ci_low"], out["ci_high"]) == (0.0, 0.0)
+
+
+def test_snapshot_round_trips(tmp_path):
+    """The repo ships the measurement as a file; if the file cannot rebuild the
+    database, the analysis is not reproducible from a clone."""
+    from evoroute.db import connect, export_snapshot, import_snapshot
+
+    src = connect(tmp_path / "src.db")
+    src.execute("INSERT INTO models (tier, ollama_tag, params_b, quant, load_ms) "
+                "VALUES ('small', 'x:1b', 1.0, 'Q4', 100.0)")
+    src.execute("INSERT INTO tasks (id, dataset, task_type, split, source_idx, "
+                "prompt, gold) VALUES (1, 'd', 'classification', 'test', 0, 'p', 'g')")
+    src.execute("INSERT INTO runs (task_id, tier, raw_output, score, latency_ms) "
+                "VALUES (1, 'small', 'o', 1.0, 50.0)")
+    src.commit()
+    counts = export_snapshot(src, tmp_path / "snap.json.gz")
+    assert counts == {"models": 1, "tasks": 1, "runs": 1}
+
+    dst = connect(tmp_path / "dst.db")
+    assert import_snapshot(dst, tmp_path / "snap.json.gz") == counts
+    assert dst.execute("SELECT score FROM runs").fetchone()["score"] == 1.0
+
+    with pytest.raises(RuntimeError, match="already holds"):
+        import_snapshot(dst, tmp_path / "snap.json.gz")

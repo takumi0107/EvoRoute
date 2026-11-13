@@ -1,13 +1,16 @@
 """Central configuration: model registry, objective weights, paths."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = ROOT / "data"
 RESULTS_DIR = ROOT / "results"
-DB_PATH = RESULTS_DIR / "evoroute.db"
+# Overridable so a snapshot round-trip can be verified against a scratch
+# database without touching the measured one.
+DB_PATH = Path(os.environ.get("EVOROUTE_DB", RESULTS_DIR / "evoroute.db"))
 
 OLLAMA_HOST = "http://127.0.0.1:11434"
 

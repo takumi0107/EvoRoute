@@ -6,6 +6,9 @@
     evoroute baseline  every routing method across the 2x2 grid
     evoroute figures   redraw the report's figures from the stored results
     evoroute stats     bootstrap CIs and arrival-order sensitivity
+    evoroute cascade   does seeing the small model's answer first help?
+    evoroute export    write the measured matrix to a portable snapshot
+    evoroute import-snapshot   rebuild a database from one
 """
 from __future__ import annotations
 
@@ -20,7 +23,8 @@ from rich.table import Table
 
 from .config import (DATASETS, DB_PATH, LOAD_PROFILES, MODELS, TIERS,
                      DEFAULT_WEIGHTS)
-from .db import insert_tasks, session, upsert_models
+from .db import (export_snapshot, import_snapshot, insert_tasks,
+                 session, upsert_models)
 from .datasets import loaders
 from .evaluation.harness import build_matrix, profile_models
 from .models.ollama_client import OllamaClient
@@ -426,6 +430,170 @@ def stats(load_profile: str = "warm", resamples: int = 2000,
         console.print(table)
         console.print("[dim]fixed routers are omitted: they never switch, so "
                       "arrival order cannot touch them.[/dim]")
+
+
+def _ceiling_and_reached(train, test, mode, weights, seeds):
+    """(reached, expressible) J on the test context, for one architecture.
+
+    `reached` fits on train like a method; `expressible` fits on test on
+    purpose. Both read whichever feature space the contexts were built with,
+    so passing cascade contexts measures the cascade architecture.
+    """
+    from .evolution.search import evolve
+
+    def best_of(fit_ctx):
+        runs = [evolve(fit_ctx, test, weights, mode,
+                       EvolutionConfig(**{**EvolutionConfig().__dict__, "seed": s}))
+                for s in seeds]
+        return max(runs, key=lambda r: r.best_train).best_test
+
+    return best_of(train), best_of(test)
+
+
+@app.command()
+def cascade(load_profile: str = "warm", seeds: int = 5) -> None:
+    """Compare the pre-hoc architecture against a cascade, under both modes.
+
+    Pre-hoc routers see only the input. A cascade runs the small model on every
+    task first and routes on what came back -- strictly more information, at
+    the cost of an inference that is always paid. Whether that trade is worth
+    taking turns out to depend on the execution mode, which is the point.
+    """
+    from .db import base_runs
+    from .evolution.search import Context
+    from .objective import evaluate_route, optimal_route
+
+    seed_list = tuple(range(seeds))
+    with session(DB_PATH) as conn:
+        train_tasks, train_matrix, train_scales = build_context(conn, "train", load_profile)
+        tasks, matrix, scales = build_context(conn, "test", load_profile)
+        order = [t["id"] for t in tasks]
+        base = {split: base_runs(conn, split, TIERS[0]) for split in ("train", "test")}
+
+        table = Table(title=f"pre-hoc vs cascade ({load_profile} load, test split, "
+                            f"{seeds} GA seeds)", title_style="bold cyan")
+        for col in ("architecture", "mode", "fixed-small", "reached",
+                    "expressible", "oracle", "reached %", "expressible %"):
+            table.add_column(col)
+
+        for label, runs in (("pre-hoc (input only)", None), ("cascade", base)):
+            for mode in MODES:
+                is_cascade = runs is not None
+                train_ctx = Context(train_tasks, train_matrix, train_scales,
+                                    runs["train"] if is_cascade else None)
+                test_ctx = Context(tasks, matrix, scales,
+                                   runs["test"] if is_cascade else None)
+                reached, expressible = _ceiling_and_reached(
+                    train_ctx, test_ctx, mode, DEFAULT_WEIGHTS, seed_list)
+                oracle = evaluate_route(
+                    optimal_route(order, matrix, scales, DEFAULT_WEIGHTS, mode, is_cascade),
+                    order, matrix, scales, DEFAULT_WEIGHTS, mode, is_cascade).objective
+                # Always-small costs the same either way: a cascade that never
+                # escalates is exactly the small model run once per task.
+                floor = evaluate_route({t: TIERS[0] for t in order}, order, matrix,
+                                       scales, DEFAULT_WEIGHTS, mode, is_cascade).objective
+                room = oracle - floor
+                pct = lambda v: (f"{(v - floor) / room * 100:5.1f}%"
+                                 if abs(room) > 1e-9 else "   n/a")
+                table.add_row(label, mode, f"{floor:.4f}", f"{reached:.4f}",
+                              f"{expressible:.4f}", f"{oracle:.4f}",
+                              pct(reached), pct(expressible))
+        console.print(table)
+        console.print("[dim]'expressible' is fitted on the test split on purpose: "
+                      "it is the feature space's ceiling, not a method. Percentages "
+                      "are of each architecture's own headroom (oracle - always-small).[/dim]")
+        _sklearn_crosscheck(conn, train_tasks, train_matrix, train_scales,
+                            tasks, matrix, scales, order, base)
+
+
+def _sklearn_crosscheck(conn, train_tasks, train_matrix, train_scales,
+                        tasks, matrix, scales, order, base) -> None:
+    """Is the failure the GA's, or the data's?
+
+    The same cascade features, handed to ordinary supervised learners instead
+    of a genetic search. If they fail too, "the search did not look hard
+    enough" is not available as an explanation.
+    """
+    import numpy as np
+    from sklearn.linear_model import Ridge
+    from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+
+    from .features import cascade_vector
+    from .objective import best_local_tier, evaluate_route, local_gains
+
+    def design(task_list, runs):
+        return np.asarray([cascade_vector(t, runs[t["id"]]["raw_output"],
+                                          runs[t["id"]]["eval_count"])
+                           for t in task_list], dtype=float)
+
+    mode = "online"
+    X_tr, X_te = design(train_tasks, base["train"]), design(tasks, base["test"])
+    n_tr = len(train_tasks)
+    y_cls = [best_local_tier(t["id"], train_matrix, train_scales, DEFAULT_WEIGHTS,
+                             n_tr, True) for t in train_tasks]
+    gains = np.asarray([[local_gains(t["id"], train_matrix, train_scales,
+                                     DEFAULT_WEIGHTS, n_tr, True)[tier]
+                         for tier in TIERS] for t in train_tasks])
+
+    floor = evaluate_route({t: TIERS[0] for t in order}, order, matrix, scales,
+                           DEFAULT_WEIGHTS, mode, True).objective
+
+    def score(routing):
+        return evaluate_route(routing, order, matrix, scales, DEFAULT_WEIGHTS,
+                              mode, True).objective
+
+    rows = []
+    for depth in (2, 3, 4, 6):
+        model = DecisionTreeClassifier(max_depth=depth, random_state=0).fit(X_tr, y_cls)
+        rows.append((f"classifier tree depth={depth}",
+                     score(dict(zip(order, model.predict(X_te))))))
+    for depth in (2, 3, 4, 6):
+        preds = np.column_stack([
+            DecisionTreeRegressor(max_depth=depth, random_state=0)
+            .fit(X_tr, gains[:, i]).predict(X_te) for i in range(len(TIERS))])
+        rows.append((f"utility tree depth={depth}",
+                     score(dict(zip(order, [TIERS[i] for i in preds.argmax(1)])))))
+    preds = np.column_stack([Ridge(alpha=1.0).fit(X_tr, gains[:, i]).predict(X_te)
+                             for i in range(len(TIERS))])
+    rows.append(("utility ridge",
+                 score(dict(zip(order, [TIERS[i] for i in preds.argmax(1)])))))
+
+    table = Table(title="same cascade features, ordinary learners instead of the GA "
+                        "(online)", title_style="bold cyan")
+    for col in ("model", "J (test)", "vs always-small"):
+        table.add_column(col)
+    for name, value in rows:
+        delta = value - floor
+        style = "[green]" if delta > 1e-6 else "[red]" if delta < -1e-6 else "[dim]"
+        table.add_row(name, f"{value:.6f}", f"{style}{delta:+.6f}[/]")
+    console.print(table)
+    console.print(f"[dim]always-small = {floor:.6f}. "
+                  "Not one learner clears it, so the failure is not the GA's.[/dim]")
+
+
+SNAPSHOT = Path("data/measurements.json.gz")
+
+
+@app.command()
+def export(path: Path = SNAPSHOT) -> None:
+    """Write the measured tables so the analysis reproduces from a clone."""
+    with session(DB_PATH) as conn:
+        counts = export_snapshot(conn, path)
+    size = path.stat().st_size / 1e6
+    console.print(f"[green]{path}[/green]  {size:.1f} MB  "
+                  + ", ".join(f"{k}={v}" for k, v in counts.items()))
+
+
+@app.command("import-snapshot")
+def import_snapshot_cmd(path: Path = SNAPSHOT) -> None:
+    """Rebuild a database from a snapshot, then run `baseline` as usual."""
+    if not path.exists():
+        raise typer.BadParameter(f"no snapshot at {path}")
+    with session(DB_PATH) as conn:
+        counts = import_snapshot(conn, path)
+    console.print("[green]imported[/green] "
+                  + ", ".join(f"{k}={v}" for k, v in counts.items()))
+    console.print(f"[dim]database: {DB_PATH}[/dim]")
 
 
 @app.command()
